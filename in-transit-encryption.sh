@@ -59,6 +59,12 @@ echo "compartment_id,compartment_name,service,resource,tls_enabled,tls_min_versi
 
 declare -A COMP_NAME
 
+# Type-safe iterator for OCI list responses. Different services/CLI versions
+# return either {"data":[...]} or {"data":{"items":[...]}}. Naively writing
+# `.data.items[]? // .data[]?` throws "cannot index array with string" when
+# .data is an array. This filter checks the type first.
+LIST_ITER='if (.data|type)=="object" then ((.data.items // []) | .[]) elif (.data|type)=="array" then (.data[]) else empty end'
+
 # $1 = comp id; auto-inserts compartment name as field 2
 row() {
   local comp_id="$1"; shift
@@ -124,15 +130,16 @@ check_lb() {
     [ -z "$lb" ] && continue
     local lbname listeners
     lbname="$(echo "$lb" | jq -r '."display-name"')"
-    # iterate listeners
-    echo "$lb" | jq -c '.listeners | to_entries[]?' 2>/dev/null | while IFS= read -r l; do
+    # iterate listeners — guard: only if .listeners is an object
+    echo "$lb" | jq -c 'if (.listeners|type)=="object" then (.listeners|to_entries[]) else empty end' 2>/dev/null | while IFS= read -r l; do
       local lname proto has_ssl minver ciphers finding
-      lname="$(echo "$l" | jq -r '.key')"
-      proto="$(echo "$l" | jq -r '.value.protocol')"
-      has_ssl="$(echo "$l" | jq -r '.value."ssl-configuration" != null')"
+      lname="$(echo "$l" | jq -r '.key // "listener"' 2>/dev/null)"
+      proto="$(echo "$l" | jq -r '.value.protocol // "?"' 2>/dev/null)"
+      has_ssl="$(echo "$l" | jq -r '(.value | has("ssl-configuration")) and (.value."ssl-configuration" != null)' 2>/dev/null)"
       if [ "$has_ssl" = "true" ]; then
-        minver="$(echo "$l" | jq -r '.value."ssl-configuration"."protocols" // [] | join(",")')"
-        ciphers="$(echo "$l" | jq -r '.value."ssl-configuration"."cipher-suite-name" // "default"')"
+        # protocols may be an array; coerce safely regardless of type
+        minver="$(echo "$l" | jq -r '(.value."ssl-configuration"."protocols") as $p | if ($p|type)=="array" then ($p|join(",")) elif $p==null then "managed" else ($p|tostring) end' 2>/dev/null)"
+        ciphers="$(echo "$l" | jq -r '.value."ssl-configuration"."cipher-suite-name" // "default"' 2>/dev/null)"
         [ -z "$minver" ] && minver="managed"
         if echo "$minver" | grep -Eq 'TLSv1\.0|TLSv1\.1'; then
           finding="WEAK-TLS-VERSION"
@@ -154,14 +161,14 @@ check_lb() {
 check_nlb() {
   local comp="$1"
   local nlbs
-  nlbs="$(o nlb network-load-balancer list --compartment-id "$comp" --all 2>/dev/null | jq -c '.data.items[]? // .data[]?' 2>/dev/null)"
+  nlbs="$(o nlb network-load-balancer list --compartment-id "$comp" --all 2>/dev/null | jq -c "$LIST_ITER" 2>/dev/null)"
   while IFS= read -r n; do
     [ -z "$n" ] && continue
     local nid nname
     nid="$(echo "$n" | jq -r '.id')"
     nname="$(echo "$n" | jq -r '."display-name"')"
     local ls
-    ls="$(o nlb listener list --network-load-balancer-id "$nid" --all 2>/dev/null | jq -c '.data.items[]? // .data[]?' 2>/dev/null)"
+    ls="$(o nlb listener list --network-load-balancer-id "$nid" --all 2>/dev/null | jq -c "$LIST_ITER" 2>/dev/null)"
     while IFS= read -r l; do
       [ -z "$l" ] && continue
       local lname proto
@@ -186,7 +193,7 @@ check_adb() {
     name="$(echo "$a" | jq -r '."db-name"')"
     mtls="$(echo "$a" | jq -r '."is-mtls-connection-required" // "unknown"')"
     # connection strings present => TLS profiles exist
-    tls_only="$(echo "$a" | jq -r '."connection-strings"."profiles" // [] | map(select(."tls-authentication"=="SERVER" or ."tls-authentication"=="MUTUAL")) | length')"
+    tls_only="$(echo "$a" | jq -r '(."connection-strings"."profiles" // []) | if type=="array" then (map(select(."tls-authentication"=="SERVER" or ."tls-authentication"=="MUTUAL")) | length) else 0 end' 2>/dev/null)"
     if [ "$mtls" = "true" ]; then
       detail="mTLS-required"; finding="OK"
     elif [ "$tls_only" != "0" ] && [ -n "$tls_only" ]; then
@@ -302,13 +309,13 @@ check_fss() {
 check_apigw() {
   local comp="$1"
   local gws
-  gws="$(o api-gateway gateway list --compartment-id "$comp" --all 2>/dev/null | jq -c '.data.items[]? // .data[]?' 2>/dev/null)"
+  gws="$(o api-gateway gateway list --compartment-id "$comp" --all 2>/dev/null | jq -c "$LIST_ITER" 2>/dev/null)"
   while IFS= read -r g; do
     [ -z "$g" ] && continue
     local gname ep tls
     gname="$(echo "$g" | jq -r '."display-name"')"
     ep="$(echo "$g" | jq -r '.hostname // "n/a"')"
-    ca="$(echo "$g" | jq -r '."ca-bundles" // [] | length')"
+    ca="$(echo "$g" | jq -r '(."ca-bundles" // []) | if type=="array" then length else 0 end' 2>/dev/null)"
     # API Gateway endpoints are HTTPS/TLS by platform; certificate config is evidence.
     row "$comp" "APIGateway" "$gname" "YES" "TLS1.2+ (platform)" "endpoint=$ep;ca-bundles=$ca" "OK" "SC-8(1)"
   done <<< "$gws"
