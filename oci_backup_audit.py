@@ -99,7 +99,12 @@ def list_compartments(identity, root, subtree=True):
         )
         comps.extend([c.id for c in resp.data])
     except oci.exceptions.ServiceError as e:
-        print(f"  ! could not list compartments: {e.message}")
+        if e.status in (401, 403):
+            print(f"  ! could not list compartments: authorization error – ensure the "
+                  f"principal has 'inspect compartments' on the root compartment. "
+                  f"({e.message})")
+        else:
+            print(f"  ! could not list compartments: {e.message}")
     return comps
 
 
