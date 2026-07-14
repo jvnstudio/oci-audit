@@ -46,21 +46,31 @@ def get_config_and_signer(profile, region_override):
     """
     Prefer Cloud Shell delegation token. Fall back to ~/.oci/config profile.
     Returns (config_dict, signer_or_None).
+
+    Cloud Shell sets OCI_DELEGATION_TOKEN_FILE; if that var is absent the token
+    is still present at the well-known path /etc/oci/delegation_token.
     """
-    delegation_path = os.environ.get("OCI_DELEGATION_TOKEN_FILE")
-    if delegation_path and os.path.exists(delegation_path):
+    # Resolve the token path: env var first, then the well-known Cloud Shell default.
+    delegation_path = (
+        os.environ.get("OCI_DELEGATION_TOKEN_FILE")
+        or "/etc/oci/delegation_token"
+    )
+    if os.path.exists(delegation_path):
         with open(delegation_path) as f:
-            token = f.read()
+            token = f.read().strip()
         # Tenancy comes from the instance principal env in Cloud Shell
         signer = oci.auth.signers.InstancePrincipalsDelegationTokenSigner(
             delegation_token=token
         )
-        config = {"region": region_override or signer.region}
-        # region may not be on signer in all SDK versions; fall back to env
-        if not config["region"]:
-            config["region"] = os.environ.get("OCI_REGION") or os.environ.get(
-                "OCI_CLI_REGION", ""
-            )
+        # Prefer explicit region env vars; signer.region may be absent in older SDK versions.
+        region = (
+            region_override
+            or os.environ.get("OCI_REGION")
+            or os.environ.get("OCI_CLI_REGION")
+            or getattr(signer, "region", None)
+            or ""
+        )
+        config = {"region": region}
         return config, signer
 
     # Fallback: config file
