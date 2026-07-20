@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# oci_backup_report_fixed.sh
+# oci_backup_report_rewritten.sh
 # ==========================
 # OCI access uses only Oracle-maintained showoci.py and Oracle OCI CLI.
 # All OCI commands are read-only list/get operations. Local CSV files are
@@ -26,7 +26,7 @@ Usage: oci_backup_report_rewritten.sh [options]
   -i              Use instance-principal authentication
   -r REGION       Scan one region
   --all-regions   Scan every subscribed region
-  -f FILE         OCI config file path
+  -f FILE         OCI config file path (auto-detects /.oci/config first)
   -o DIR          Output directory (default: current directory)
   -x PREFIX       CSV filename stem (default: report)
   -s PATH         Path to showoci.py
@@ -119,17 +119,44 @@ try:
 except (OSError, configparser.Error):
     sys.exit(1)
 
-if not parser.has_section(profile) or not parser.has_option(profile, key):
+# ConfigParser treats [DEFAULT] specially, so handle it explicitly.
+if profile == "DEFAULT":
+    value = parser.defaults().get(key)
+else:
+    value = parser.get(profile, key, fallback=None) if parser.has_section(profile) else None
+
+if not value:
     sys.exit(0)
-print(os.path.expandvars(os.path.expanduser(parser.get(profile, key).strip())))
+
+value = os.path.expandvars(os.path.expanduser(value.strip()))
+if not os.path.isabs(value):
+    value = os.path.join(os.path.dirname(os.path.realpath(file_name)), value)
+print(os.path.realpath(value))
 PYCFG
 }
 
+select_config_file() {
+  if [[ -n "$CONFIG_FILE" ]]; then
+    CONFIG_FILE="$(expand_path "$CONFIG_FILE")"
+    return
+  fi
+
+  # Prefer the deployment-standard root location requested by the operator.
+  if [[ -f "/.oci/config" ]]; then
+    CONFIG_FILE="/.oci/config"
+  elif [[ -f "$HOME/.oci/config" ]]; then
+    CONFIG_FILE="$HOME/.oci/config"
+  else
+    CONFIG_FILE="/.oci/config"
+  fi
+}
+
 preflight_config_auth() {
-  CONFIG_FILE="$(expand_path "${CONFIG_FILE:-$HOME/.oci/config}")"
+  select_config_file
 
   if [[ ! -e "$CONFIG_FILE" ]]; then
     echo "ERROR: OCI config file does not exist: $CONFIG_FILE" >&2
+    echo "       Checked /.oci/config first, then $HOME/.oci/config." >&2
     exit 1
   fi
   if [[ ! -f "$CONFIG_FILE" ]]; then
