@@ -1,82 +1,52 @@
 #!/usr/bin/env bash
 #
-# oci_backup_report.sh
-# ====================
-# Storage backup report for an OCI tenancy using ONLY:
-#   1. showoci.py  (Oracle-MAINTAINED SDK example; NOT an official/supported
-#      Oracle product) — storage inventory + assigned policies + backups taken
-#   2. OCI CLI     (oci bv volume-backup-policy list/get) — each Block/Boot
-#      Volume backup policy's full schedule: type/period/retention
-#
-# READ-ONLY AGAINST OCI: only list/get operations are used; no OCI resource is
-# modified. NOTE: this script DOES create and may OVERWRITE local CSV files.
-# The OCI read-only guarantee for Step 1 also depends on you supplying an
-# unmodified, reviewed showoci.py.
-#
-# SCOPE LIMITS (be honest for audit use):
-#   - Step 2 covers Block and Boot Volume policies ONLY. It does NOT cover
-#     File Storage snapshot policies, Object Storage retention/versioning/
-#     replication, ADB/Base DB backup config, or Recovery Service policies.
-#   - A schedule proves INTENT, not that backups actually ran or are restorable.
-#   - Policy schedules are emitted to a separate CSV; correlate them to
-#     resources using the assigned policy id/name in showoci's CSVs.
-#
-# Requirements: python3 + oci SDK (showoci), oci CLI (Step 2), a configured
-# ~/.oci/config profile OR instance principals on an OCI VM.
-#
-# Usage:
-#   ./oci_backup_report.sh -p GOVCLOUD -r us-langley-1     # one region (recommended)
-#   ./oci_backup_report.sh -p GOVCLOUD --all-regions       # iterate subscribed regions
-#   ./oci_backup_report.sh -i -r us-langley-1              # instance-principal auth
-#   ./oci_backup_report.sh -p GOVCLOUD -r us-langley-1 -f ~/.oci/config -s /path/showoci.py -o out
+# oci_backup_report_fixed.sh
+# ==========================
+# OCI access uses only Oracle-maintained showoci.py and Oracle OCI CLI.
+# All OCI commands are read-only list/get operations. Local CSV files are
+# created or replaced.
 
-set -euo pipefail
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
 PROFILE="DEFAULT"
-AUTH="config"          # config | instance_principal
+AUTH="config"
 REGION=""
 ALL_REGIONS="false"
 PREFIX="report"
 OUTDIR="."
 SHOWOCI=""
 CONFIG_FILE=""
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 usage() {
-  cat <<EOF
-Usage: $0 [options]
-  -p PROFILE      OCI config profile name (default: DEFAULT)
-  -i              Use instance-principal auth instead of config file
-  -r REGION       Report a single region (recommended for consistent evidence)
-  --all-regions   Iterate every subscribed region for Step 2 (stronger evidence)
-  -f FILE         OCI config file path (default: ~/.oci/config)
-  -o DIR          Output directory (default: current folder)
-  -x PREFIX       CSV filename stem, no path (default: report)
-  -s PATH         Path to showoci.py (default: auto-detect)
-  -h              Show this help
+  cat <<'USAGE'
+Usage: oci_backup_report_fixed.sh [options]
+  -p PROFILE      OCI config profile (default: DEFAULT)
+  -i              Use instance-principal authentication
+  -r REGION       Scan one region
+  --all-regions   Scan every subscribed region
+  -f FILE         OCI config file path
+  -o DIR          Output directory (default: current directory)
+  -x PREFIX       CSV filename stem (default: report)
+  -s PATH         Path to showoci.py
+  -h              Show help
 
-You must pass EITHER -r REGION or --all-regions so that showoci scope and the
-policy-schedule export scope match. Running neither is refused, because it would
-produce a multi-region inventory with a single-region schedule export.
-EOF
-  exit 0
+Pass exactly one of -r REGION or --all-regions.
+USAGE
 }
 
-# ---------------------------------------------------------------------------
-# Parse args (long option --all-regions handled manually)
-# ---------------------------------------------------------------------------
 ARGS=()
-for a in "$@"; do
-  case "$a" in
-    --all-regions) ALL_REGIONS="true" ;;
-    *) ARGS+=("$a") ;;
+while (($#)); do
+  case "$1" in
+    --all-regions) ALL_REGIONS="true"; shift ;;
+    --) shift; ARGS+=("$@"); break ;;
+    *) ARGS+=("$1"); shift ;;
   esac
 done
-set -- "${ARGS[@]:-}"
+set -- "${ARGS[@]}"
 
-while getopts "p:ir:f:o:x:s:h" opt; do
+while getopts ":p:ir:f:o:x:s:h" opt; do
   case "$opt" in
     p) PROFILE="$OPTARG" ;;
     i) AUTH="instance_principal" ;;
@@ -85,238 +55,523 @@ while getopts "p:ir:f:o:x:s:h" opt; do
     o) OUTDIR="$OPTARG" ;;
     x) PREFIX="$OPTARG" ;;
     s) SHOWOCI="$OPTARG" ;;
-    h) usage ;;
-    *) usage ;;
+    h) usage; exit 0 ;;
+    :) echo "ERROR: -$OPTARG requires a value." >&2; exit 2 ;;
+    \?) echo "ERROR: unknown option -$OPTARG" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-# ---------------------------------------------------------------------------
-# Validate scope + prefix
-# ---------------------------------------------------------------------------
 if [[ -z "$REGION" && "$ALL_REGIONS" != "true" ]]; then
-  echo "ERROR: pass -r REGION (single region) or --all-regions." >&2
-  echo "       Refusing to run so inventory scope and schedule scope stay aligned." >&2
+  echo "ERROR: pass -r REGION or --all-regions." >&2
   exit 2
 fi
 if [[ -n "$REGION" && "$ALL_REGIONS" == "true" ]]; then
   echo "ERROR: use either -r REGION or --all-regions, not both." >&2
   exit 2
 fi
-if [[ "$PREFIX" != "$(basename "$PREFIX")" ]]; then
-  echo "ERROR: -x prefix must be a filename stem with no path component." >&2
+if [[ ! "$PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$PREFIX" == "." || "$PREFIX" == ".." ]]; then
+  echo "ERROR: prefix must use only letters, digits, dot, underscore, and hyphen." >&2
   exit 2
 fi
 
-mkdir -p "$OUTDIR"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "ERROR: Python not found: $PYTHON_BIN" >&2; exit 1; }
+command -v oci >/dev/null 2>&1 || { echo "ERROR: OCI CLI ('oci') is not installed." >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Locate showoci.py
-# ---------------------------------------------------------------------------
+mkdir -p -- "$OUTDIR"
+OUTDIR="$(cd -- "$OUTDIR" && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
 if [[ -z "$SHOWOCI" ]]; then
-  for cand in "./showoci.py" "$(dirname "$0")/showoci.py" \
-              "$HOME/oci-python-sdk/examples/showoci/showoci.py"; do
-    [[ -f "$cand" ]] && { SHOWOCI="$cand"; break; }
+  for candidate in \
+    "$HOME/oci-python-sdk/examples/showoci/showoci.py" \
+    "$SCRIPT_DIR/showoci.py" \
+    "$PWD/showoci.py"; do
+    if [[ -f "$candidate" ]]; then
+      SHOWOCI="$candidate"
+      break
+    fi
   done
 fi
-if [[ -z "$SHOWOCI" || ! -f "$SHOWOCI" ]]; then
-  echo "ERROR: showoci.py not found. Pass it with -s /path/to/showoci.py" >&2
-  exit 1
-fi
+[[ -n "$SHOWOCI" && -f "$SHOWOCI" ]] || { echo "ERROR: showoci.py not found; use -s PATH." >&2; exit 1; }
+SHOWOCI="$(cd -- "$(dirname -- "$SHOWOCI")" && pwd -P)/$(basename -- "$SHOWOCI")"
 
-# ---------------------------------------------------------------------------
-# Auth arrays
-# ---------------------------------------------------------------------------
-SHOWOCI_AUTH=(); CLI_AUTH=()
+CLI_AUTH=()
+SHOWOCI_AUTH=()
 if [[ "$AUTH" == "instance_principal" ]]; then
-  SHOWOCI_AUTH+=("-ip")
-  CLI_AUTH+=("--auth" "instance_principal")
+  CLI_AUTH+=(--auth instance_principal)
+  SHOWOCI_AUTH+=(-ip)
 else
-  SHOWOCI_AUTH+=("-t" "$PROFILE")
-  CLI_AUTH+=("--profile" "$PROFILE")
+  CLI_AUTH+=(--profile "$PROFILE")
+  SHOWOCI_AUTH+=(-t "$PROFILE")
   if [[ -n "$CONFIG_FILE" ]]; then
-    SHOWOCI_AUTH+=("-cf" "$CONFIG_FILE")
-    CLI_AUTH+=("--config-file" "$CONFIG_FILE")
+    [[ -f "$CONFIG_FILE" ]] || { echo "ERROR: config file not found: $CONFIG_FILE" >&2; exit 1; }
+    CONFIG_FILE="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)/$(basename -- "$CONFIG_FILE")"
+    CLI_AUTH+=(--config-file "$CONFIG_FILE")
+    SHOWOCI_AUTH+=(-cf "$CONFIG_FILE")
   fi
 fi
 
-echo "============================================================" >&2
-echo " OCI STORAGE BACKUP REPORT  (READ-ONLY AGAINST OCI)" >&2
-echo "   profile     : $PROFILE" >&2
-echo "   auth        : $AUTH" >&2
-if [[ "$ALL_REGIONS" == "true" ]]; then
-  echo "   region      : ALL SUBSCRIBED (Step 2 iterates)" >&2
-else
-  echo "   region      : $REGION" >&2
-fi
-echo "   showoci     : $SHOWOCI (Oracle-maintained SDK example; not a supported product)" >&2
-echo "   output      : $OUTDIR/${PREFIX}_*.csv" >&2
-echo "   note        : creates/overwrites local CSVs; Step 2 = Block/Boot Volume policies only" >&2
-echo "============================================================" >&2
+# Pass auth to embedded Python without lossy whitespace splitting.
+export OCI_REPORT_AUTH="$AUTH"
+export OCI_REPORT_PROFILE="$PROFILE"
+export OCI_REPORT_CONFIG_FILE="$CONFIG_FILE"
 
-# ---------------------------------------------------------------------------
-# Determine region list
-# ---------------------------------------------------------------------------
+run_oci_json() {
+  oci "$@" "${CLI_AUTH[@]}" --output json
+}
+
 REGION_LIST=()
 if [[ "$ALL_REGIONS" == "true" ]]; then
-  echo "" >&2; echo ">>> Enumerating subscribed regions ..." >&2
-  if ! command -v oci >/dev/null 2>&1; then
-    echo "ERROR: --all-regions needs the OCI CLI to list subscriptions." >&2
+  echo ">>> Enumerating subscribed regions ..." >&2
+  REGION_JSON="$(run_oci_json iam region-subscription list --all)" || {
+    echo "ERROR: unable to enumerate subscribed regions." >&2
     exit 1
-  fi
-  # region subscription list is read-only
-  _REG_JSON="$(oci iam region-subscription list "${CLI_AUTH[@]}" --output json 2>/dev/null || true)"
-  mapfile -t REGION_LIST < <(REG_JSON="$_REG_JSON" python3 -c '
-import os, json, sys
-try:
-    d = json.loads(os.environ.get("REG_JSON") or "{}")
-except Exception:
-    sys.exit(0)
-rows = d.get("data", d) if isinstance(d, dict) else d
-for r in (rows or []):
-    name = r.get("region-name") if isinstance(r, dict) else r
+  }
+  mapfile -t REGION_LIST < <(
+    REGION_JSON="$REGION_JSON" "$PYTHON_BIN" - <<'PY'
+import json, os
+payload = json.loads(os.environ["REGION_JSON"])
+for row in payload.get("data", []):
+    name = row.get("region-name")
     if name:
         print(name)
-')
-  if [[ ${#REGION_LIST[@]} -eq 0 ]]; then
-    echo "ERROR: could not enumerate subscribed regions (auth/permission?)." >&2
-    exit 1
-  fi
-  echo "    regions: ${REGION_LIST[*]}" >&2
+PY
+  )
+  ((${#REGION_LIST[@]})) || { echo "ERROR: no subscribed regions returned." >&2; exit 1; }
 else
   REGION_LIST=("$REGION")
 fi
 
-# ---------------------------------------------------------------------------
-# STEP 1 — showoci inventory (per region so scope matches Step 2)
-# ---------------------------------------------------------------------------
-echo "" >&2; echo ">>> STEP 1: showoci inventory ..." >&2
+printf '%s\n' "============================================================" >&2
+printf ' OCI STORAGE BACKUP REPORT (showoci + OCI CLI, READ-ONLY)\n' >&2
+printf ' auth       : %s\n' "$AUTH" >&2
+printf ' profile    : %s\n' "$PROFILE" >&2
+printf ' regions    : %s\n' "${REGION_LIST[*]}" >&2
+printf ' showoci    : %s\n' "$SHOWOCI" >&2
+printf ' output dir : %s\n' "$OUTDIR" >&2
+printf '%s\n' "============================================================" >&2
+
+# Remove only this run's generated aggregate files. Inventory files are emitted
+# with region-specific prefixes and checked after each showoci run.
+POLICY_CSV="$OUTDIR/${PREFIX}_backup_policy_schedules.csv"
+FSS_POLICY_CSV="$OUTDIR/${PREFIX}_fss_snapshot_schedules.csv"
+JOINED_CSV="$OUTDIR/${PREFIX}_storage_backup_joined.csv"
+rm -f -- "$POLICY_CSV" "$FSS_POLICY_CSV" "$JOINED_CSV"
+
+# STEP 1: showoci is the primary collector.
+echo ">>> STEP 1: showoci inventory" >&2
+INVENTORY_PREFIXES=()
 for rg in "${REGION_LIST[@]}"; do
-  echo "    [showoci] region $rg" >&2
-  # Per-region prefix keeps evidence separable and scope-aligned with Step 2.
-  python3 "$SHOWOCI" "${SHOWOCI_AUTH[@]}" -rg "$rg" -a \
-    -csv "${OUTDIR}/${PREFIX}_${rg}"
+  inv_prefix="$OUTDIR/${PREFIX}_${rg}"
+  INVENTORY_PREFIXES+=("$inv_prefix")
+  echo "    [showoci] $rg" >&2
+
+  # Remove stale files for this exact regional prefix before collection.
+  find "$OUTDIR" -maxdepth 1 -type f -name "${PREFIX}_${rg}_*.csv" -delete
+
+  "$PYTHON_BIN" "$SHOWOCI" "${SHOWOCI_AUTH[@]}" -rg "$rg" -a -csv "$inv_prefix"
+
+  shopt -s nullglob
+  generated=("${inv_prefix}"_*.csv)
+  shopt -u nullglob
+  if ((${#generated[@]} == 0)); then
+    echo "ERROR: showoci produced no CSV files for region $rg." >&2
+    exit 1
+  fi
 done
-echo ">>> showoci CSVs: ${OUTDIR}/${PREFIX}_<region>_*.csv" >&2
 
-# ---------------------------------------------------------------------------
-# STEP 2 — Block/Boot Volume backup policy schedules, PER REGION, with status
-# ---------------------------------------------------------------------------
-POLICY_CSV="${OUTDIR}/${PREFIX}_backup_policy_schedules.csv"
-
-if ! command -v oci >/dev/null 2>&1; then
-  echo "" >&2
-  echo ">>> STEP 2 SKIPPED: 'oci' CLI not installed." >&2
-  echo "    showoci CSVs still contain volumes + assigned policy names + backups taken." >&2
-  echo "============================================================" >&2
-  echo " DONE (Step 1 only). Files in: $(cd "$OUTDIR" && pwd)" >&2
-  echo "============================================================" >&2
-  exit 0
-fi
-
-echo "" >&2; echo ">>> STEP 2: backup POLICY SCHEDULES via OCI CLI (per region) ..." >&2
-
-# Header includes region + explicit collection status columns.
-echo "region,policy_id,policy_name,schedule_status,backup_type,period,hour_of_day,day_of_week,day_of_month,month,retention_seconds,time_zone,collection_status,collection_error" > "$POLICY_CSV"
-
-# Export vars for the per-region Python worker.
-export POLICY_CSV
-export CLI_AUTH_STR="${CLI_AUTH[*]}"
+# STEP 2/2b workers. Custom Block policies are compartment-scoped; Oracle-
+# defined policies are returned by listing without --compartment-id.
+echo ">>> STEP 2: Block/Boot and FSS policy schedules" >&2
+export POLICY_CSV FSS_POLICY_CSV
+printf '%s\n' 'region,compartment_id,policy_id,policy_name,schedule_status,backup_type,period,hour_of_day,day_of_week,day_of_month,month,retention_seconds,time_zone,collection_status,collection_error' > "$POLICY_CSV"
+printf '%s\n' 'region,compartment_id,policy_id,policy_name,schedule_status,period,hour_of_day,day_of_week,day_of_month,month,retention_seconds,time_zone,collection_status,collection_error' > "$FSS_POLICY_CSV"
 
 overall_rc=0
 for rg in "${REGION_LIST[@]}"; do
-  echo "    [policies] region $rg" >&2
-  REGION_ARG="$rg" python3 <<'PYEOF'
-import os, sys, json, csv, subprocess
+  echo "    [policy enrichment] $rg" >&2
+  if ! REGION_ARG="$rg" "$PYTHON_BIN" - <<'PY'; then
+import csv
+import json
+import os
+import subprocess
+import sys
+from typing import Any
 
-region   = os.environ["REGION_ARG"]
-csv_path = os.environ["POLICY_CSV"]
-auth     = os.environ.get("CLI_AUTH_STR", "").split()
+region = os.environ["REGION_ARG"]
+block_csv = os.environ["POLICY_CSV"]
+fss_csv = os.environ["FSS_POLICY_CSV"]
+auth_mode = os.environ.get("OCI_REPORT_AUTH", "config")
+profile = os.environ.get("OCI_REPORT_PROFILE", "DEFAULT")
+config_file = os.environ.get("OCI_REPORT_CONFIG_FILE", "")
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+auth_args: list[str] = []
+if auth_mode == "instance_principal":
+    auth_args = ["--auth", "instance_principal"]
+else:
+    auth_args = ["--profile", profile]
+    if config_file:
+        auth_args += ["--config-file", config_file]
 
-# 1) list policies for THIS region (region explicitly passed)
-list_cmd = ["oci", "bv", "volume-backup-policy", "list", "--all",
-            "--region", region, "--output", "json", *auth]
-r = run(list_cmd)
 
-with open(csv_path, "a", newline="", encoding="utf-8") as fh:
-    w = csv.writer(fh)
+def run_oci(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["oci", *args, *auth_args, "--output", "json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    if r.returncode != 0:
-        err = (r.stderr or "").strip().replace("\n", " ")[:300] or "list failed"
-        w.writerow([region, "", "", "", "", "", "", "", "", "", "", "",
-                    "LIST_FAILED", err])
-        sys.exit(3)
 
-    try:
-        policies = (json.loads(r.stdout or "{}") or {}).get("data", []) or []
-    except json.JSONDecodeError as e:
-        w.writerow([region, "", "", "", "", "", "", "", "", "", "", "",
-                    "LIST_PARSE_ERROR", str(e)[:300]])
-        sys.exit(3)
+def parse_data(result: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]:
+    payload = json.loads(result.stdout or "{}")
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
 
-    if not policies:
-        w.writerow([region, "", "", "", "", "", "", "", "", "", "", "",
-                    "NO_POLICIES_RETURNED", ""])
-        sys.exit(0)
 
-    rc = 0
-    for pol in policies:
-        pid   = pol.get("id", "")
-        pname = pol.get("display-name", "")
+def clean_error(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout or "command failed").strip().replace("\n", " ")[:500]
 
-        g = run(["oci", "bv", "volume-backup-policy", "get",
-                 "--policy-id", pid, "--region", region,
-                 "--output", "json", *auth])
-        if g.returncode != 0:
-            err = (g.stderr or "").strip().replace("\n", " ")[:300] or "get failed"
-            w.writerow([region, pid, pname, "", "", "", "", "", "", "", "", "",
-                        "LOOKUP_FAILED", err])
+rc = 0
+
+# include-root gives us the tenancy root explicitly. ACCESSIBLE avoids claiming
+# that inaccessible compartments were fully assessed.
+comp_result = run_oci(
+    "iam", "compartment", "list",
+    "--compartment-id-in-subtree", "true",
+    "--include-root",
+    "--access-level", "ACCESSIBLE",
+    "--all",
+    "--region", region,
+)
+if comp_result.returncode != 0:
+    msg = clean_error(comp_result)
+    with open(block_csv, "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow([region, "", "", "", "", "", "", "", "", "", "", "", "", "COMPARTMENT_LIST_FAILED", msg])
+    with open(fss_csv, "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow([region, "", "", "", "", "", "", "", "", "", "", "", "COMPARTMENT_LIST_FAILED", msg])
+    sys.exit(3)
+
+try:
+    compartments = parse_data(comp_result)
+except (json.JSONDecodeError, TypeError) as exc:
+    msg = str(exc)[:500]
+    with open(block_csv, "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow([region, "", "", "", "", "", "", "", "", "", "", "", "", "COMPARTMENT_PARSE_ERROR", msg])
+    with open(fss_csv, "a", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow([region, "", "", "", "", "", "", "", "", "", "", "", "COMPARTMENT_PARSE_ERROR", msg])
+    sys.exit(3)
+
+compartment_ids: list[str] = []
+for compartment in compartments:
+    cid = compartment.get("id")
+    state = compartment.get("lifecycle-state")
+    if cid and state != "DELETED" and cid not in compartment_ids:
+        compartment_ids.append(cid)
+
+# ---- Block/Boot policies ----
+seen_policy_ids: set[str] = set()
+block_rows = 0
+with open(block_csv, "a", newline="", encoding="utf-8") as fh:
+    writer = csv.writer(fh)
+
+    scopes: list[tuple[str, list[str]]] = [("ORACLE_DEFINED", [])]
+    scopes.extend((cid, ["--compartment-id", cid]) for cid in compartment_ids)
+
+    for compartment_id, scope_args in scopes:
+        listed = run_oci(
+            "bv", "volume-backup-policy", "list", "--all",
+            "--region", region,
+            *scope_args,
+        )
+        if listed.returncode != 0:
+            writer.writerow([region, compartment_id, "", "", "", "", "", "", "", "", "", "", "", "LIST_FAILED", clean_error(listed)])
             rc = 3
             continue
-
         try:
-            data = (json.loads(g.stdout or "{}") or {}).get("data", {}) or {}
-        except json.JSONDecodeError as e:
-            w.writerow([region, pid, pname, "", "", "", "", "", "", "", "", "",
-                        "GET_PARSE_ERROR", str(e)[:300]])
+            policies = parse_data(listed)
+        except (json.JSONDecodeError, TypeError) as exc:
+            writer.writerow([region, compartment_id, "", "", "", "", "", "", "", "", "", "", "", "LIST_PARSE_ERROR", str(exc)[:500]])
             rc = 3
             continue
 
-        scheds = data.get("schedules", []) or []
-        if not scheds:
-            # preserve one row so "exists w/ zero schedules" is distinguishable
-            w.writerow([region, pid, pname, "NO_SCHEDULES",
-                        "", "", "", "", "", "", "", "", "OK", ""])
+        for policy in policies:
+            pid = policy.get("id", "")
+            if not pid or pid in seen_policy_ids:
+                continue
+            seen_policy_ids.add(pid)
+            pname = policy.get("display-name", "")
+            detail = run_oci(
+                "bv", "volume-backup-policy", "get",
+                "--policy-id", pid,
+                "--region", region,
+            )
+            if detail.returncode != 0:
+                writer.writerow([region, compartment_id, pid, pname, "", "", "", "", "", "", "", "", "", "LOOKUP_FAILED", clean_error(detail)])
+                rc = 3
+                continue
+            try:
+                data = json.loads(detail.stdout or "{}").get("data", {}) or {}
+            except json.JSONDecodeError as exc:
+                writer.writerow([region, compartment_id, pid, pname, "", "", "", "", "", "", "", "", "", "GET_PARSE_ERROR", str(exc)[:500]])
+                rc = 3
+                continue
+            schedules = data.get("schedules", []) or []
+            if not schedules:
+                writer.writerow([region, compartment_id, pid, pname, "NO_SCHEDULES", "", "", "", "", "", "", "", "", "OK", ""])
+                block_rows += 1
+                continue
+            for schedule in schedules:
+                writer.writerow([
+                    region, compartment_id, pid, pname, "HAS_SCHEDULE",
+                    schedule.get("backup-type", ""),
+                    schedule.get("period", ""),
+                    schedule.get("hour-of-day", ""),
+                    schedule.get("day-of-week", ""),
+                    schedule.get("day-of-month", ""),
+                    schedule.get("month", ""),
+                    schedule.get("retention-seconds", ""),
+                    schedule.get("time-zone", ""),
+                    "OK", "",
+                ])
+                block_rows += 1
+
+    if block_rows == 0 and rc == 0:
+        writer.writerow([region, "", "", "", "", "", "", "", "", "", "", "", "", "NO_POLICIES_RETURNED", ""])
+
+# ---- FSS snapshot policies ----
+fss_rows = 0
+with open(fss_csv, "a", newline="", encoding="utf-8") as fh:
+    writer = csv.writer(fh)
+    for compartment_id in compartment_ids:
+        listed = run_oci(
+            "fs", "snapshot-policy", "list",
+            "--compartment-id", compartment_id,
+            "--all",
+            "--region", region,
+        )
+        if listed.returncode != 0:
+            writer.writerow([region, compartment_id, "", "", "", "", "", "", "", "", "", "", "COMPARTMENT_LIST_FAILED", clean_error(listed)])
+            rc = 3
+            continue
+        try:
+            policies = parse_data(listed)
+        except (json.JSONDecodeError, TypeError) as exc:
+            writer.writerow([region, compartment_id, "", "", "", "", "", "", "", "", "", "", "LIST_PARSE_ERROR", str(exc)[:500]])
+            rc = 3
             continue
 
-        for s in scheds:
-            w.writerow([
-                region, pid, pname, "HAS_SCHEDULE",
-                s.get("backup-type", ""), s.get("period", ""),
-                s.get("hour-of-day", ""), s.get("day-of-week", ""),
-                s.get("day-of-month", ""), s.get("month", ""),
-                s.get("retention-seconds", ""), s.get("time-zone", ""),
-                "OK", "",
-            ])
-    sys.exit(rc)
-PYEOF
-  rc=$?
-  [[ $rc -ne 0 ]] && overall_rc=$rc
+        for policy in policies:
+            pid = policy.get("id", "")
+            pname = policy.get("display-name", "")
+            schedules = policy.get("schedules", []) or []
+            if not schedules:
+                writer.writerow([region, compartment_id, pid, pname, "NO_SCHEDULES", "", "", "", "", "", "", "", "OK", ""])
+                fss_rows += 1
+                continue
+            for schedule in schedules:
+                writer.writerow([
+                    region, compartment_id, pid, pname, "HAS_SCHEDULE",
+                    schedule.get("period", ""),
+                    schedule.get("hour-of-day", ""),
+                    schedule.get("day-of-week", ""),
+                    schedule.get("day-of-month", ""),
+                    schedule.get("month", ""),
+                    schedule.get("retention-duration-in-seconds", ""),
+                    schedule.get("time-zone", ""),
+                    "OK", "",
+                ])
+                fss_rows += 1
+
+    if fss_rows == 0 and rc == 0:
+        writer.writerow([region, "", "", "", "", "", "", "", "", "", "", "", "NO_POLICIES_RETURNED", ""])
+
+sys.exit(rc)
+PY
+    overall_rc=3
+  fi
 done
 
-echo ">>> policy schedules: $POLICY_CSV" >&2
+# STEP 3: Join showoci inventory with regional policy schedules. The join is
+# intentionally conservative: absence of a detected policy field is not called
+# "not backed up" without verification.
+echo ">>> STEP 3: joined resource-level report" >&2
+export OUTDIR PREFIX JOINED_CSV POLICY_CSV FSS_POLICY_CSV
+if ! "$PYTHON_BIN" - <<'PY'; then
+import csv
+import glob
+import os
+import re
+import sys
+from collections import defaultdict
 
-echo "" >&2
-echo "============================================================" >&2
-echo " DONE. Files in: $(cd "$OUTDIR" && pwd)" >&2
-echo "   ${PREFIX}_<region>_*.csv                 (showoci inventory + backups)" >&2
-echo "   ${PREFIX}_backup_policy_schedules.csv    (Block/Boot policy schedules + status)" >&2
-if [[ $overall_rc -ne 0 ]]; then
-  echo "" >&2
-  echo " WARNING: one or more collection steps failed. Check the" >&2
-  echo "          collection_status column before drawing conclusions." >&2
+outdir = os.environ["OUTDIR"]
+prefix = os.environ["PREFIX"]
+joined = os.environ["JOINED_CSV"]
+
+
+def load_schedules(path: str, block: bool):
+    by_id = defaultdict(list)
+    by_name = defaultdict(list)
+    if not os.path.isfile(path):
+        return by_id, by_name
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("collection_status") != "OK":
+                continue
+            status = row.get("schedule_status", "")
+            if status not in {"HAS_SCHEDULE", "NO_SCHEDULES"}:
+                continue
+            details = []
+            if block and row.get("backup_type"):
+                details.append(f"type={row['backup_type']}")
+            for field, label in (
+                ("period", "period"), ("hour_of_day", "hour"),
+                ("day_of_week", "dow"), ("day_of_month", "dom"),
+                ("month", "month"), ("retention_seconds", "retention_sec"),
+                ("time_zone", "tz"),
+            ):
+                if row.get(field):
+                    details.append(f"{label}={row[field]}")
+            entry = (status, "; ".join(details) or status)
+            region = row.get("region", "")
+            pid = row.get("policy_id", "").strip()
+            pname = row.get("policy_name", "").strip()
+            if pid:
+                by_id[(region, pid)].append(entry)
+            if pname:
+                by_name[(region, pname)].append(entry)
+    return by_id, by_name
+
+
+block_id, block_name = load_schedules(os.environ["POLICY_CSV"], True)
+fss_id, fss_name = load_schedules(os.environ["FSS_POLICY_CSV"], False)
+
+
+def find_column(headers, patterns):
+    for pattern in patterns:
+        rx = re.compile(pattern, re.I)
+        for header in headers:
+            if rx.search(header or ""):
+                return header
+    return None
+
+
+def classify(filename, headers):
+    name = filename.lower()
+    header_text = " ".join(headers).lower()
+    if any(token in name for token in ("backup_policy_schedules", "fss_snapshot_schedules", "storage_backup_joined")):
+        return None, None
+    if "boot" in name and "backup" not in name:
+        return "Boot Volume", "block"
+    if "block" in name and "backup" not in name:
+        return "Block Volume", "block"
+    if any(token in name for token in ("filesystem", "file_system", "fss")) or "snapshot policy" in header_text:
+        return "File System (FSS)", "fss"
+    if any(token in name for token in ("bucket", "object_storage", "objectstorage")):
+        return "Object Storage Bucket", "object"
+    return None, None
+
+
+def lookup(region, pid, pname, by_id, by_name):
+    entries = by_id.get((region, pid)) if pid else None
+    if not entries and pname:
+        entries = by_name.get((region, pname))
+    if not entries:
+        return "UNKNOWN", ""
+    statuses = "|".join(sorted({item[0] for item in entries}))
+    details = " || ".join(item[1] for item in entries if item[1])
+    return statuses, details
+
+headers_out = [
+    "region", "compartment", "resource_type", "resource_name", "resource_id",
+    "assigned_policy_name", "assigned_policy_id", "protection_type",
+    "schedule_status", "schedule_detail", "notes", "source_file",
+]
+rows_out = []
+
+for path in sorted(glob.glob(os.path.join(outdir, f"{prefix}_*_*.csv"))):
+    base = os.path.basename(path)
+    resource_type, family = classify(base, [])
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            headers = reader.fieldnames or []
+            resource_type, family = classify(base, headers)
+            if not family:
+                continue
+            rows = list(reader)
+    except (OSError, csv.Error):
+        continue
+
+    c_region = find_column(headers, [r"^region$", r"region.?name"])
+    c_comp = find_column(headers, [r"compartment.*name", r"^compartment$"])
+    c_name = find_column(headers, [r"display.?name", r"^name$", r"bucket.?name", r"resource.?name"])
+    c_id = find_column(headers, [r"^id$", r"\bocid\b", r"volume.?id", r"file.?system.?id"])
+    c_pid = find_column(headers, [r"backup.*policy.*id", r"snapshot.*policy.*id", r"policy.*id"])
+    c_pname = find_column(headers, [r"backup.*policy.*name", r"snapshot.*policy.*name", r"policy.*name", r"backup.*policy$"])
+    c_version = find_column(headers, [r"versioning"])
+    c_replication = find_column(headers, [r"replicat"])
+    c_retention = find_column(headers, [r"retention"])
+
+    region_match = re.match(re.escape(prefix) + r"_([^_]+(?:-[^_]+)*)_", base)
+    filename_region = region_match.group(1) if region_match else ""
+
+    for row in rows:
+        region = (row.get(c_region, "") if c_region else "") or filename_region
+        compartment = row.get(c_comp, "") if c_comp else ""
+        name = row.get(c_name, "") if c_name else ""
+        rid = row.get(c_id, "") if c_id else ""
+        pid = (row.get(c_pid, "") if c_pid else "").strip()
+        pname = (row.get(c_pname, "") if c_pname else "").strip()
+
+        if family == "object":
+            controls = []
+            for column, label in ((c_version, "versioning"), (c_retention, "retention"), (c_replication, "replication")):
+                if column and row.get(column):
+                    controls.append(f"{label}={row[column]}")
+            rows_out.append([
+                region, compartment, resource_type, name, rid, "", "",
+                "object-storage-controls", "N/A", "; ".join(controls),
+                "Object Storage does not use Block Volume backup policies; verify versioning, retention rules, and replication independently.",
+                base,
+            ])
+            continue
+
+        by_id, by_name = (block_id, block_name) if family == "block" else (fss_id, fss_name)
+        if not pid and not pname:
+            status, detail = "NO_POLICY_REFERENCE_DETECTED", ""
+            note = "No policy reference was detected in this showoci row. Verify the source CSV and actual policy assignment before concluding that the resource is unprotected."
+        else:
+            status, detail = lookup(region, pid, pname, by_id, by_name)
+            note = "" if status != "UNKNOWN" else "Policy reference did not resolve to a successfully collected schedule in the same region. Check permissions, collection status, and CSV column mapping."
+        rows_out.append([
+            region, compartment, resource_type, name, rid, pname, pid,
+            "policy-based", status, detail, note, base,
+        ])
+
+with open(joined, "w", newline="", encoding="utf-8") as fh:
+    writer = csv.writer(fh)
+    writer.writerow(headers_out)
+    writer.writerows(rows_out)
+
+print(f"    joined rows: {len(rows_out)}", file=sys.stderr)
+if not rows_out:
+    print("    WARNING: no storage inventory rows matched recognized showoci CSV patterns.", file=sys.stderr)
+    sys.exit(3)
+PY
+  overall_rc=3
 fi
-echo "============================================================" >&2
-exit $overall_rc
+
+printf '%s\n' "============================================================" >&2
+printf ' DONE. Files in: %s\n' "$OUTDIR" >&2
+printf '   %s_<region>_*.csv\n' "$PREFIX" >&2
+printf '   %s\n' "$(basename "$POLICY_CSV")" >&2
+printf '   %s\n' "$(basename "$FSS_POLICY_CSV")" >&2
+printf '   %s\n' "$(basename "$JOINED_CSV")" >&2
+if ((overall_rc != 0)); then
+  printf ' WARNING: one or more enrichment/join steps were incomplete.\n' >&2
+  printf ' Review collection_status and collection_error before findings.\n' >&2
+fi
+printf '%s\n' "============================================================" >&2
+exit "$overall_rc"
