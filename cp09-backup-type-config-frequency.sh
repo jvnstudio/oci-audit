@@ -16,12 +16,12 @@ ALL_REGIONS="false"
 PREFIX="report"
 OUTDIR="."
 SHOWOCI=""
-CONFIG_FILE=""
+CONFIG_FILE="${OCI_CONFIG_FILE:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 usage() {
   cat <<'USAGE'
-Usage: oci_backup_report_fixed.sh [options]
+Usage: oci_backup_report_rewritten.sh [options]
   -p PROFILE      OCI config profile (default: DEFAULT)
   -i              Use instance-principal authentication
   -r REGION       Scan one region
@@ -95,20 +95,109 @@ fi
 [[ -n "$SHOWOCI" && -f "$SHOWOCI" ]] || { echo "ERROR: showoci.py not found; use -s PATH." >&2; exit 1; }
 SHOWOCI="$(cd -- "$(dirname -- "$SHOWOCI")" && pwd -P)/$(basename -- "$SHOWOCI")"
 
+expand_path() {
+  local path="$1"
+  case "$path" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${path#~/}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+read_profile_value() {
+  local file="$1" profile="$2" key="$3"
+  "$PYTHON_BIN" - "$file" "$profile" "$key" <<'PYCFG'
+import configparser
+import os
+import sys
+
+file_name, profile, key = sys.argv[1:4]
+parser = configparser.RawConfigParser()
+try:
+    with open(file_name, "r", encoding="utf-8") as stream:
+        parser.read_file(stream)
+except (OSError, configparser.Error):
+    sys.exit(1)
+
+if not parser.has_section(profile) or not parser.has_option(profile, key):
+    sys.exit(0)
+print(os.path.expandvars(os.path.expanduser(parser.get(profile, key).strip())))
+PYCFG
+}
+
+preflight_config_auth() {
+  CONFIG_FILE="$(expand_path "${CONFIG_FILE:-$HOME/.oci/config}")"
+
+  if [[ ! -e "$CONFIG_FILE" ]]; then
+    echo "ERROR: OCI config file does not exist: $CONFIG_FILE" >&2
+    exit 1
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: OCI config path is not a regular file: $CONFIG_FILE" >&2
+    exit 1
+  fi
+  if [[ ! -r "$CONFIG_FILE" ]]; then
+    echo "ERROR: OCI config file is not readable by user $(id -un): $CONFIG_FILE" >&2
+    echo "Directory/file permissions:" >&2
+    if command -v namei >/dev/null 2>&1; then
+      namei -l "$CONFIG_FILE" >&2 || true
+    else
+      ls -ld "$(dirname -- "$CONFIG_FILE")" "$CONFIG_FILE" >&2 || true
+    fi
+    exit 1
+  fi
+
+  CONFIG_FILE="$($PYTHON_BIN - "$CONFIG_FILE" <<'PYPATH'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PYPATH
+)"
+
+  local key_file token_file
+  key_file="$(read_profile_value "$CONFIG_FILE" "$PROFILE" key_file || true)"
+  token_file="$(read_profile_value "$CONFIG_FILE" "$PROFILE" security_token_file || true)"
+
+  if [[ -z "$key_file" && -z "$token_file" ]]; then
+    echo "ERROR: profile [$PROFILE] was not found or has neither key_file nor security_token_file:" >&2
+    echo "       $CONFIG_FILE" >&2
+    exit 1
+  fi
+
+  for credential_file in "$key_file" "$token_file"; do
+    [[ -z "$credential_file" ]] && continue
+    credential_file="$(expand_path "$credential_file")"
+    if [[ ! -e "$credential_file" ]]; then
+      echo "ERROR: credential file referenced by profile [$PROFILE] does not exist:" >&2
+      echo "       $credential_file" >&2
+      exit 1
+    fi
+    if [[ ! -f "$credential_file" || ! -r "$credential_file" ]]; then
+      echo "ERROR: credential file referenced by profile [$PROFILE] is not readable by $(id -un):" >&2
+      echo "       $credential_file" >&2
+      if command -v namei >/dev/null 2>&1; then
+        namei -l "$credential_file" >&2 || true
+      else
+        ls -ld "$(dirname -- "$credential_file")" "$credential_file" >&2 || true
+      fi
+      exit 1
+    fi
+  done
+
+  echo ">>> OCI authentication preflight passed." >&2
+  echo "    user   : $(id -un) (uid=$(id -u))" >&2
+  echo "    profile: $PROFILE" >&2
+  echo "    config : $CONFIG_FILE" >&2
+}
+
 CLI_AUTH=()
 SHOWOCI_AUTH=()
 if [[ "$AUTH" == "instance_principal" ]]; then
   CLI_AUTH+=(--auth instance_principal)
   SHOWOCI_AUTH+=(-ip)
 else
-  CLI_AUTH+=(--profile "$PROFILE")
-  SHOWOCI_AUTH+=(-t "$PROFILE")
-  if [[ -n "$CONFIG_FILE" ]]; then
-    [[ -f "$CONFIG_FILE" ]] || { echo "ERROR: config file not found: $CONFIG_FILE" >&2; exit 1; }
-    CONFIG_FILE="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd -P)/$(basename -- "$CONFIG_FILE")"
-    CLI_AUTH+=(--config-file "$CONFIG_FILE")
-    SHOWOCI_AUTH+=(-cf "$CONFIG_FILE")
-  fi
+  preflight_config_auth
+  CLI_AUTH+=(--profile "$PROFILE" --config-file "$CONFIG_FILE")
+  SHOWOCI_AUTH+=(-t "$PROFILE" -cf "$CONFIG_FILE")
 fi
 
 # Pass auth to embedded Python without lossy whitespace splitting.
