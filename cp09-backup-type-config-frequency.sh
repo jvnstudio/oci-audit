@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test
+#
 # oci_backup_report_rewritten.sh
 # ==========================
 # OCI access uses only Oracle-maintained showoci.py and Oracle OCI CLI.
@@ -16,7 +16,7 @@ ALL_REGIONS="false"
 PREFIX="report"
 OUTDIR="."
 SHOWOCI=""
-CONFIG_FILE="${OCI_CONFIG_FILE:-}"
+CONFIG_FILE=""
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 usage() {
@@ -26,7 +26,7 @@ Usage: oci_backup_report_rewritten.sh [options]
   -i              Use instance-principal authentication
   -r REGION       Scan one region
   --all-regions   Scan every subscribed region
-  -f FILE         OCI config file path (auto-detects /.oci/config first)
+  -f FILE         OCI config file path (default: /.oci/config)
   -o DIR          Output directory (default: current directory)
   -x PREFIX       CSV filename stem (default: report)
   -s PATH         Path to showoci.py
@@ -138,14 +138,6 @@ PYCFG
 select_config_file() {
   if [[ -n "$CONFIG_FILE" ]]; then
     CONFIG_FILE="$(expand_path "$CONFIG_FILE")"
-    return
-  fi
-
-  # Prefer the deployment-standard root location requested by the operator.
-  if [[ -f "/.oci/config" ]]; then
-    CONFIG_FILE="/.oci/config"
-  elif [[ -f "$HOME/.oci/config" ]]; then
-    CONFIG_FILE="$HOME/.oci/config"
   else
     CONFIG_FILE="/.oci/config"
   fi
@@ -156,7 +148,7 @@ preflight_config_auth() {
 
   if [[ ! -e "$CONFIG_FILE" ]]; then
     echo "ERROR: OCI config file does not exist: $CONFIG_FILE" >&2
-    echo "       Checked /.oci/config first, then $HOME/.oci/config." >&2
+    echo "       Default expected location: /.oci/config" >&2
     exit 1
   fi
   if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -216,6 +208,9 @@ PYPATH
   echo "    config : $CONFIG_FILE" >&2
 }
 
+# Do not inherit a different config location such as /etc/oci/config.
+unset OCI_CONFIG_FILE OCI_CLI_CONFIG_FILE 2>/dev/null || true
+
 CLI_AUTH=()
 SHOWOCI_AUTH=()
 if [[ "$AUTH" == "instance_principal" ]]; then
@@ -223,6 +218,8 @@ if [[ "$AUTH" == "instance_principal" ]]; then
   SHOWOCI_AUTH+=(-ip)
 else
   preflight_config_auth
+  export OCI_CONFIG_FILE="$CONFIG_FILE"
+  export OCI_CLI_CONFIG_FILE="$CONFIG_FILE"
   CLI_AUTH+=(--profile "$PROFILE" --config-file "$CONFIG_FILE")
   SHOWOCI_AUTH+=(-t "$PROFILE" -cf "$CONFIG_FILE")
 fi
