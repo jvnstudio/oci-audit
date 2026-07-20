@@ -1,44 +1,28 @@
 #!/usr/bin/env python3
 """
-showoci Backup-Frequency Enricher
-=================================
-Companion to Oracle's official `showoci.py` (examples/showoci in the
-oci-python-sdk repo). showoci reports WHICH backup policy is assigned to each
-volume / file system, but not the policy's SCHEDULE (frequency + retention).
+showoci Backup-Frequency Enricher (simple mode)
+==============================================
+Companion to Oracle's official showoci.py. It finds showoci's CSV files, figures
+out which are volume vs file-storage on its own, and adds a `schedule_frequency`
+column showing each backup policy's schedule + retention.
 
-This script reads showoci's CSV output and adds a `schedule_frequency` column
-by resolving each referenced policy. It is strictly READ-ONLY: the only OCI
-calls it makes are:
-    - get_volume_backup_policy      (block/boot volume policies)
-    - get_snapshot_policy           (file storage snapshot policies)
-    - list_volume_backup_policies   (optional, to match by policy NAME)
-No resource is ever created, changed, or deleted. Output is a new CSV.
+READ-ONLY: only get_volume_backup_policy / get_snapshot_policy /
+list_volume_backup_policies are ever called. Nothing is modified. New CSVs are
+written next to the originals with a _freq suffix.
 
 SDK: https://github.com/oracle/oci-python-sdk
 
-Workflow:
-  1. Run showoci and export CSV, e.g.:
-        python3 showoci.py -p GOVCLOUD -c report
-     (produces report_*.csv, including a block-volume file and an fss file)
+Usage (that's it):
+    python3 showoci_backup_freq.py --profile GOVCLOUD
 
-  2. Enrich the block-volume file:
-        python3 showoci_backup_freq_enrich.py \
-            --in report_block_volumes.csv \
-            --kind block --profile GOVCLOUD \
-            --out report_block_volumes_freq.csv
-
-  3. Enrich the file-storage file:
-        python3 showoci_backup_freq_enrich.py \
-            --in report_file_storage.csv \
-            --kind fss --profile GOVCLOUD \
-            --out report_file_storage_freq.csv
-
-If unsure which column holds the policy, run with --inspect to just print the
-detected columns and exit (no OCI calls made).
+By default it scans the current folder for showoci CSVs. To point elsewhere:
+    python3 showoci_backup_freq.py --profile GOVCLOUD --dir /path/to/showoci/output
 """
 
 import argparse
 import csv
+import glob
+import os
 import re
 import sys
 
@@ -46,23 +30,21 @@ import oci
 
 
 # --------------------------------------------------------------------------- #
-# READ-ONLY guard (same philosophy as before: abort if a mutating call exists)
+# READ-ONLY guard
 # --------------------------------------------------------------------------- #
-_MUTATING_HINTS = ("create_", "update_", "delete_", "assign_", "remove_",
-                   "put_", "post_", "attach_", "detach_", "change_",
-                   "terminate_", "add_", "modify_", "restore_", "copy_")
-_STDLIB_OK = {"add_argument"}
+_MUTATING = ("create_", "update_", "delete_", "assign_", "remove_", "put_",
+             "post_", "attach_", "detach_", "change_", "terminate_", "add_",
+             "modify_", "restore_", "copy_")
+_OK = {"add_argument"}
 
 
-def _assert_read_only(source_path):
+def _assert_read_only():
     try:
-        src = open(source_path).read()
+        src = open(__file__).read()
     except OSError:
         return
     for m in re.findall(r"\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", src):
-        if m in _STDLIB_OK:
-            continue
-        if any(m.startswith(h) for h in _MUTATING_HINTS):
+        if m not in _OK and any(m.startswith(h) for h in _MUTATING):
             raise SystemExit(f"READ-ONLY GUARD: mutating call detected: '{m}'")
 
 
@@ -79,37 +61,43 @@ def build_clients(args):
         cfg = oci.config.from_file(args.config_file, args.profile)
         bs = oci.core.BlockstorageClient(config=cfg)
         fss = oci.file_storage.FileStorageClient(config=cfg)
-    if args.region:
-        bs.base_client.set_region(args.region)
-        fss.base_client.set_region(args.region)
     return bs, fss
 
 
 # --------------------------------------------------------------------------- #
-# Column auto-detection
+# Detection
 # --------------------------------------------------------------------------- #
-def detect_columns(headers):
-    """Return dict with best-guess column names for policy id, policy name, ocid."""
-    lower = {h.lower(): h for h in headers}
+def find_policy_column(headers):
+    """Return (column_name, kind) or (None, None). kind = 'block' or 'fss'."""
+    for h in headers:
+        lh = h.lower()
+        if "snapshot" in lh and "polic" in lh:
+            return h, "fss"
+    for h in headers:
+        lh = h.lower()
+        if "backup" in lh and "polic" in lh:
+            return h, "block"
+    # generic 'policy id' fallback -> assume block (most common)
+    for h in headers:
+        if re.search(r"polic.*id", h.lower()):
+            return h, "block"
+    return None, None
 
-    def find(*patterns):
-        for pat in patterns:
-            for lh, orig in lower.items():
-                if re.search(pat, lh):
-                    return orig
+
+def looks_like_showoci_csv(path):
+    try:
+        with open(path, newline="") as f:
+            headers = next(csv.reader(f), [])
+    except (OSError, StopIteration):
         return None
-
-    return {
-        "policy_id":   find(r"policy.*id", r"backup_policy_id", r"snapshot_policy_id"),
-        "policy_name": find(r"policy.*name", r"backup_policy", r"snapshot_policy"),
-        "ocid":        find(r"^id$", r"volume_?id", r"file.?system.?id", r"\bocid\b"),
-    }
+    col, kind = find_policy_column(headers)
+    return (col, kind, headers) if col else None
 
 
 # --------------------------------------------------------------------------- #
 # Schedule formatting
 # --------------------------------------------------------------------------- #
-def fmt_block_schedule(s):
+def fmt_block(s):
     parts = [f"type={s.backup_type}", f"period={s.period}"]
     if s.hour_of_day is not None: parts.append(f"hour={s.hour_of_day}")
     if s.day_of_week: parts.append(f"dow={s.day_of_week}")
@@ -120,7 +108,7 @@ def fmt_block_schedule(s):
     return "; ".join(parts)
 
 
-def fmt_fss_schedule(s):
+def fmt_fss(s):
     parts = [f"period={s.period}"]
     if s.hour_of_day is not None: parts.append(f"hour={s.hour_of_day}")
     if s.day_of_week: parts.append(f"dow={s.day_of_week}")
@@ -136,126 +124,111 @@ def fmt_fss_schedule(s):
 # Policy resolution (cached)
 # --------------------------------------------------------------------------- #
 class Resolver:
-    def __init__(self, bs, fss, kind):
-        self.bs, self.fss, self.kind = bs, fss, kind
-        self.cache = {}
-        self._name_index = None  # lazy: name -> policy_id for block policies
+    def __init__(self, bs, fss):
+        self.bs, self.fss, self.cache = bs, fss, {}
+        self.name_index = None
 
-    def _block_name_index(self, compartment_id=None):
-        if self._name_index is None:
-            self._name_index = {}
+    def _names(self):
+        if self.name_index is None:
+            self.name_index = {}
             try:
-                pols = oci.pagination.list_call_get_all_results(
-                    self.bs.list_volume_backup_policies
-                ).data
-                for p in pols:
-                    self._name_index[p.display_name] = p.id
+                for p in oci.pagination.list_call_get_all_results(
+                        self.bs.list_volume_backup_policies).data:
+                    self.name_index[p.display_name] = p.id
             except oci.exceptions.ServiceError:
                 pass
-        return self._name_index
+        return self.name_index
 
-    def by_id(self, policy_id):
-        if not policy_id:
-            return ""
-        if policy_id in self.cache:
-            return self.cache[policy_id]
-        out = ""
-        try:
-            if self.kind == "block":
-                pol = self.bs.get_volume_backup_policy(policy_id).data
-                out = " | ".join(fmt_block_schedule(s) for s in pol.schedules) or "(no schedules)"
-            else:
-                pol = self.fss.get_snapshot_policy(policy_id).data
-                out = " | ".join(fmt_fss_schedule(s) for s in (pol.schedules or [])) or "(no schedules)"
-        except oci.exceptions.ServiceError as e:
-            out = f"(unresolved: {e.code})"
-        self.cache[policy_id] = out
+    def resolve(self, value, kind):
+        value = (value or "").strip()
+        if not value:
+            return "NOT BACKED UP"
+        key = (value, kind)
+        if key in self.cache:
+            return self.cache[key]
+
+        # value may be an OCID or a policy name
+        pid = value
+        if not value.startswith("ocid1.") and kind == "block":
+            pid = self._names().get(value, "")
+
+        out = "NOT BACKED UP"
+        if pid.startswith("ocid1."):
+            try:
+                if kind == "block":
+                    pol = self.bs.get_volume_backup_policy(pid).data
+                    out = " | ".join(fmt_block(s) for s in pol.schedules) or "(no schedules)"
+                else:
+                    pol = self.fss.get_snapshot_policy(pid).data
+                    out = " | ".join(fmt_fss(s) for s in (pol.schedules or [])) or "(no schedules)"
+            except oci.exceptions.ServiceError as e:
+                out = f"(unresolved: {e.code})"
+        elif value and kind == "fss":
+            out = "(need policy OCID for fss)"
+
+        self.cache[key] = out
         return out
-
-    def by_name(self, name):
-        if not name:
-            return ""
-        if self.kind != "block":
-            return "(name-lookup only supported for block policies; provide policy id)"
-        pid = self._block_name_index().get(name)
-        return self.by_id(pid) if pid else "(policy name not found)"
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
-    p = argparse.ArgumentParser(description="Enrich showoci CSV with backup schedule frequency.")
-    p.add_argument("--in", dest="infile", required=True, help="showoci CSV file")
-    p.add_argument("--out", dest="outfile", help="output CSV (default: <in>_freq.csv)")
-    p.add_argument("--kind", choices=["block", "fss"], required=True,
-                   help="block = block/boot volume CSV; fss = file storage CSV")
+    p = argparse.ArgumentParser(description="Add backup schedule frequency to showoci CSVs.")
+    p.add_argument("--dir", default=".", help="Folder with showoci CSV files (default: current)")
     p.add_argument("--auth", choices=["config", "instance_principal"], default="config")
     p.add_argument("--config-file", default=oci.config.DEFAULT_LOCATION)
     p.add_argument("--profile", default="DEFAULT")
-    p.add_argument("--region", help="Limit to one region (matches showoci region)")
-    p.add_argument("--inspect", action="store_true",
-                   help="Just print detected columns and exit (no OCI calls)")
     args = p.parse_args()
 
-    _assert_read_only(__file__)
+    _assert_read_only()
 
-    with open(args.infile, newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        headers = reader.fieldnames or []
+    csv_files = sorted(glob.glob(os.path.join(args.dir, "*.csv")))
+    csv_files = [f for f in csv_files if not f.endswith("_freq.csv")]
+    targets = []
+    for f in csv_files:
+        info = looks_like_showoci_csv(f)
+        if info:
+            col, kind, headers = info
+            targets.append((f, col, kind, headers))
 
-    cols = detect_columns(headers)
-    print("Detected columns:", file=sys.stderr)
-    print(f"  policy_id   -> {cols['policy_id']}", file=sys.stderr)
-    print(f"  policy_name -> {cols['policy_name']}", file=sys.stderr)
-    print(f"  ocid        -> {cols['ocid']}", file=sys.stderr)
-
-    if args.inspect:
-        print("\nAll headers:", file=sys.stderr)
-        for h in headers:
-            print(f"    {h}", file=sys.stderr)
-        return
-
-    if not cols["policy_id"] and not cols["policy_name"]:
+    if not targets:
         raise SystemExit(
-            "Could not find a policy id or policy name column. "
-            "Run with --inspect to see headers, then map manually."
+            f"No showoci CSVs with a backup/snapshot policy column found in '{args.dir}'.\n"
+            f"Run showoci first, e.g.:  python3 showoci.py -p {args.profile} -c report"
         )
 
     print("=" * 60, file=sys.stderr)
-    print("READ-ONLY: get_volume_backup_policy / get_snapshot_policy only.",
-          file=sys.stderr)
+    print("READ-ONLY: reads backup policies only, changes nothing.", file=sys.stderr)
+    print(f"Found {len(targets)} storage CSV(s) to enrich:", file=sys.stderr)
+    for f, col, kind, _ in targets:
+        print(f"  {os.path.basename(f)}  [{kind}]  policy col: {col}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
 
     bs, fss = build_clients(args)
-    resolver = Resolver(bs, fss, args.kind)
+    resolver = Resolver(bs, fss)
 
-    out_headers = list(headers)
-    if "schedule_frequency" not in out_headers:
-        out_headers.append("schedule_frequency")
+    for path, col, kind, headers in targets:
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        out_headers = list(headers)
+        if "schedule_frequency" not in out_headers:
+            out_headers.append("schedule_frequency")
+        done = 0
+        for r in rows:
+            freq = resolver.resolve(r.get(col), kind)
+            r["schedule_frequency"] = freq
+            if freq not in ("NOT BACKED UP",):
+                done += 1
+        out_path = re.sub(r"\.csv$", "_freq.csv", path)
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=out_headers)
+            w.writeheader()
+            w.writerows(rows)
+        print(f"{os.path.basename(out_path)}: {len(rows)} rows, "
+              f"{done} with a schedule.", file=sys.stderr)
 
-    enriched = 0
-    for r in rows:
-        freq = ""
-        pid = r.get(cols["policy_id"]) if cols["policy_id"] else None
-        if pid and pid.startswith("ocid1."):
-            freq = resolver.by_id(pid)
-        elif cols["policy_name"]:
-            freq = resolver.by_name(r.get(cols["policy_name"], "").strip())
-        r["schedule_frequency"] = freq or "NOT BACKED UP"
-        if freq:
-            enriched += 1
-
-    outfile = args.outfile or re.sub(r"\.csv$", "", args.infile) + "_freq.csv"
-    with open(outfile, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=out_headers)
-        w.writeheader()
-        w.writerows(rows)
-
-    print(f"\nRows processed : {len(rows)}", file=sys.stderr)
-    print(f"With schedule  : {enriched}", file=sys.stderr)
-    print(f"Output written : {outfile}", file=sys.stderr)
+    print("\nDone.", file=sys.stderr)
 
 
 if __name__ == "__main__":
