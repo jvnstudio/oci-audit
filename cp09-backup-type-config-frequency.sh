@@ -1,102 +1,174 @@
-#!/usr/bin/env python3
-"""
-OCI Storage Backup Report — one command
-=======================================
-Runs Oracle's official showoci.py, then runs the backup-frequency enricher on
-its CSV output. You run ONE command; it does both steps.
+#!/usr/bin/env bash
+#
+# oci_backup_report.sh
+# ====================
+# Produces a storage BACKUP report for an OCI tenancy using ONLY:
+#   1. Oracle's official showoci.py   (which storage exists + assigned policies + backups taken)
+#   2. Oracle's official OCI CLI      (each backup policy's full schedule: type/period/retention)
+#
+# READ-ONLY: only list/get operations are used. Nothing in OCI is modified.
+# All output is written to CSV files.
+#
+# Requirements:
+#   - python3 + oci SDK           (pip install oci)
+#   - showoci.py                  (oci-python-sdk/examples/showoci)
+#   - oci CLI                     (for policy schedule detail; optional)
+#   - a configured ~/.oci/config profile, or instance principals on an OCI VM
+#
+# Usage:
+#   ./oci_backup_report.sh -p GOVCLOUD
+#   ./oci_backup_report.sh -p GOVCLOUD -r us-langley-1
+#   ./oci_backup_report.sh -i                       # instance-principal auth
+#   ./oci_backup_report.sh -p GOVCLOUD -s /path/to/showoci.py -o /path/to/output
+#
 
-READ-ONLY: showoci and the enricher only read. Nothing in OCI is modified.
+set -euo pipefail
 
-Layout expected (all in the same folder, or point with flags):
-    showoci.py                  <- Oracle's tool (from oci-python-sdk/examples/showoci)
-    showoci_backup_freq.py      <- the enricher
-    run_backup_report.py        <- this script
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+PROFILE="DEFAULT"
+AUTH="config"          # config | instance_principal
+REGION=""
+PREFIX="report"
+OUTDIR="."
+SHOWOCI=""             # auto-detected if empty
 
-Usage:
-    python3 run_backup_report.py --profile GOVCLOUD
-    python3 run_backup_report.py --profile GOVCLOUD --region us-langley-1
-    python3 run_backup_report.py --auth instance_principal
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+  -p PROFILE   OCI config profile name (default: DEFAULT)
+  -i           Use instance-principal auth instead of config file
+  -r REGION    Limit to one region (default: all subscribed)
+  -o DIR       Output directory (default: current folder)
+  -x PREFIX    CSV filename prefix (default: report)
+  -s PATH      Path to showoci.py (default: auto-detect)
+  -h           Show this help
+EOF
+  exit 0
+}
 
-Output:
-    report_*.csv        <- raw showoci CSVs
-    report_*_freq.csv   <- same data + schedule_frequency column
-"""
+# ---------------------------------------------------------------------------
+# Parse args
+# ---------------------------------------------------------------------------
+while getopts "p:ir:o:x:s:h" opt; do
+  case "$opt" in
+    p) PROFILE="$OPTARG" ;;
+    i) AUTH="instance_principal" ;;
+    r) REGION="$OPTARG" ;;
+    o) OUTDIR="$OPTARG" ;;
+    x) PREFIX="$OPTARG" ;;
+    s) SHOWOCI="$OPTARG" ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
 
-import argparse
-import os
-import subprocess
-import sys
+mkdir -p "$OUTDIR"
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# ---------------------------------------------------------------------------
+# Locate showoci.py
+# ---------------------------------------------------------------------------
+if [[ -z "$SHOWOCI" ]]; then
+  for cand in "./showoci.py" "$(dirname "$0")/showoci.py" \
+              "$HOME/oci-python-sdk/examples/showoci/showoci.py"; do
+    if [[ -f "$cand" ]]; then SHOWOCI="$cand"; break; fi
+  done
+fi
+if [[ -z "$SHOWOCI" || ! -f "$SHOWOCI" ]]; then
+  echo "ERROR: showoci.py not found. Pass it with -s /path/to/showoci.py" >&2
+  exit 1
+fi
 
+echo "============================================================" >&2
+echo " OCI STORAGE BACKUP REPORT  (READ-ONLY)" >&2
+echo "   profile : $PROFILE" >&2
+echo "   auth    : $AUTH" >&2
+echo "   region  : ${REGION:-all subscribed}" >&2
+echo "   showoci : $SHOWOCI" >&2
+echo "   output  : $OUTDIR/${PREFIX}_*.csv" >&2
+echo "============================================================" >&2
 
-def find(name, override):
-    """Locate a helper script: use override if given, else look next to this file."""
-    if override:
-        if not os.path.isfile(override):
-            sys.exit(f"Not found: {override}")
-        return override
-    guess = os.path.join(HERE, name)
-    if not os.path.isfile(guess):
-        sys.exit(f"Could not find {name} next to this script ({HERE}). "
-                 f"Pass its path explicitly.")
-    return guess
+# ---------------------------------------------------------------------------
+# Build auth flags for showoci and CLI
+# ---------------------------------------------------------------------------
+SHOWOCI_AUTH=()
+CLI_AUTH=()
+if [[ "$AUTH" == "instance_principal" ]]; then
+  SHOWOCI_AUTH+=("-ip")
+  CLI_AUTH+=("--auth" "instance_principal")
+else
+  SHOWOCI_AUTH+=("-t" "$PROFILE")
+  CLI_AUTH+=("--profile" "$PROFILE")
+fi
 
+SHOWOCI_REGION=()
+[[ -n "$REGION" ]] && SHOWOCI_REGION+=("-rg" "$REGION")
 
-def run(cmd, label):
-    print(f"\n=== {label} ===", file=sys.stderr)
-    print("  " + " ".join(cmd), file=sys.stderr)
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        sys.exit(f"{label} failed (exit {result.returncode}). Stopping.")
+# ---------------------------------------------------------------------------
+# STEP 1 — showoci: storage inventory + assigned policies + backups taken
+# ---------------------------------------------------------------------------
+echo "" >&2
+echo ">>> STEP 1: running showoci.py ..." >&2
+python3 "$SHOWOCI" "${SHOWOCI_AUTH[@]}" "${SHOWOCI_REGION[@]}" \
+  -a -csv "${OUTDIR}/${PREFIX}"
+echo ">>> showoci CSVs written: ${OUTDIR}/${PREFIX}_*.csv" >&2
 
+# ---------------------------------------------------------------------------
+# STEP 2 — OCI CLI: dump every backup policy's full schedule (type/period/retention)
+# ---------------------------------------------------------------------------
+POLICY_CSV="${OUTDIR}/${PREFIX}_backup_policy_schedules.csv"
 
-def main():
-    p = argparse.ArgumentParser(description="Run showoci + backup-frequency enrichment in one go.")
-    p.add_argument("--profile", default="DEFAULT", help="OCI config profile")
-    p.add_argument("--auth", choices=["config", "instance_principal"], default="config")
-    p.add_argument("--region", help="Limit to one region (default: all subscribed)")
-    p.add_argument("--prefix", default="report", help="showoci CSV filename prefix (default: report)")
-    p.add_argument("--dir", default=".", help="Where CSVs are written / read (default: current folder)")
-    p.add_argument("--showoci", help="Path to showoci.py (default: look next to this script)")
-    p.add_argument("--enricher", help="Path to showoci_backup_freq.py (default: next to this script)")
-    p.add_argument("--config-file", help="OCI config file path")
-    args = p.parse_args()
+if command -v oci >/dev/null 2>&1; then
+  echo "" >&2
+  echo ">>> STEP 2: exporting backup POLICY SCHEDULES via OCI CLI ..." >&2
 
-    showoci = find("showoci.py", args.showoci)
-    enricher = find("showoci_backup_freq.py", args.enricher)
+  # header
+  echo "policy_id,policy_name,backup_type,period,hour_of_day,day_of_week,day_of_month,month,retention_seconds,time_zone" > "$POLICY_CSV"
 
-    os.makedirs(args.dir, exist_ok=True)
-    # showoci writes to CWD, so run it from --dir
-    prefix_path = os.path.join(args.dir, args.prefix)
-
-    # ---- Step 1: showoci -> CSV ----
-    showoci_cmd = ["python3", showoci, "-c", prefix_path]
-    if args.auth == "instance_principal":
-        showoci_cmd.append("-ip")
-    else:
-        showoci_cmd += ["-p", args.profile]
-        if args.config_file:
-            showoci_cmd += ["-cf", args.config_file]
-    if args.region:
-        showoci_cmd += ["-rg", args.region]
-    run(showoci_cmd, "STEP 1: showoci (official Oracle reporting tool)")
-
-    # ---- Step 2: enrich CSVs with backup frequency ----
-    enrich_cmd = ["python3", enricher, "--dir", args.dir, "--auth", args.auth]
-    if args.auth == "config":
-        enrich_cmd += ["--profile", args.profile]
-        if args.config_file:
-            enrich_cmd += ["--config-file", args.config_file]
-    run(enrich_cmd, "STEP 2: add backup schedule frequency")
-
-    print("\n" + "=" * 60, file=sys.stderr)
-    print("Done. Look for *_freq.csv in:", os.path.abspath(args.dir), file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
-
-
-if __name__ == "__main__":
+  # List all volume backup policies (predefined + user), then expand each schedule.
+  # j-based flattening via --query keeps it pure-CLI, no extra .py files.
+  export POLICY_CSV
+  export CLI_AUTH_STR="${CLI_AUTH[*]}"
+  oci bv volume-backup-policy list "${CLI_AUTH[@]}" --all \
+    --query "data[].{id:id,name:\"display-name\"}" --output json 2>/dev/null \
+  | python3 -c '
+import sys, json, csv, subprocess, os
+try:
+    policies = json.load(sys.stdin) or []
+except Exception:
+    policies = []
+auth = os.environ.get("CLI_AUTH_STR","").split()
+w = csv.writer(open(os.environ["POLICY_CSV"], "a", newline=""))
+for pol in policies:
+    pid = pol.get("id"); pname = pol.get("name","")
     try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+        out = subprocess.run(
+            ["oci","bv","volume-backup-policy","get","--policy-id",pid,
+             "--output","json",*auth],
+            capture_output=True, text=True, check=True)
+        data = json.loads(out.stdout).get("data",{})
+    except Exception:
+        continue
+    for s in data.get("schedules",[]) or []:
+        w.writerow([pid, pname,
+            s.get("backup-type",""), s.get("period",""),
+            s.get("hour-of-day",""), s.get("day-of-week",""),
+            s.get("day-of-month",""), s.get("month",""),
+            s.get("retention-seconds",""), s.get("time-zone","")])
+' 2>/dev/null || echo "   (note: policy schedule export skipped — CLI query returned nothing)" >&2
+
+  echo ">>> policy schedules written: $POLICY_CSV" >&2
+else
+  echo "" >&2
+  echo ">>> STEP 2 SKIPPED: 'oci' CLI not installed." >&2
+  echo "    showoci CSVs still contain volumes + assigned policy names + backups taken." >&2
+  echo "    Install OCI CLI to also export full policy schedules." >&2
+fi
+
+echo "" >&2
+echo "============================================================" >&2
+echo " DONE. Report files in: $(cd "$OUTDIR" && pwd)" >&2
+echo "   ${PREFIX}_*.csv                         (showoci: storage + backups)" >&2
+[[ -f "$POLICY_CSV" ]] && echo "   ${PREFIX}_backup_policy_schedules.csv   (policy type/period/retention)" >&2
+echo "============================================================" >&2
